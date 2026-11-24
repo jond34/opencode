@@ -92,6 +92,11 @@ const cache = new Map<
     toolOpen: Record<string, boolean | undefined>
     patchGroupKeys: Map<string, string>
     presentationKey?: string
+    /**
+     * Where a reader who had left the end was when the view went: the row at the top of the view, and how far into
+     * it the view began. Kept by row, because rows above it can come and go before the session has a view again.
+     */
+    place?: { key: string; offset: number }
   }
 >()
 
@@ -163,6 +168,20 @@ export function createTimelineVirtualizer(input: Input) {
   const entry = cache.get(ownerSessionKey)
   const cached = entry?.presentationKey === input.presentationKey?.() ? entry : undefined
   const initialMeasurements = cached?.measurements
+  // The place kept from the view this one replaces, while its row is still in the list.
+  const placed = entry?.place && input.projection.rowByKey().has(entry.place.key) ? entry.place : undefined
+
+  // A view is built for a session the reader opens or comes back to. A reader who had scrolled up comes back to
+  // their place. One whose place went with the view that held it comes back to the end, like a reader who followed.
+  if (placed) input.follow.dispatch({ type: "detach" })
+
+  if (!placed && !input.follow.following() && !input.follow.anchor()) input.follow.dispatch({ type: "follow" })
+
+  // The follow state belongs to the session on screen. A view that is not shown keeps what its own reader last had.
+  const follows = createMemo<boolean>(
+    (previous) => (active() ? input.follow.following() : previous),
+    input.follow.following(),
+  )
 
   const [coldMount, setColdMount] = createSignal(
     createColdMountState(!initialMeasurements?.length && input.follow.following()),
@@ -357,7 +376,14 @@ export function createTimelineVirtualizer(input: Input) {
         dispatchCold(CHECK_REQUESTED)
       })
     },
-    initialOffset: () => (input.follow.following() ? Number.MAX_SAFE_INTEGER : 0),
+    // Near the kept place, so that the first rows to mount are the ones the reader comes back to.
+    initialOffset: () => {
+      if (input.follow.following()) return Number.MAX_SAFE_INTEGER
+
+      if (!placed) return 0
+
+      return Math.max(0, (initialMeasurements?.find((item) => item.key === placed.key)?.start ?? 0) + placed.offset)
+    },
     initialMeasurementsCache: initialMeasurements,
     estimateSize: () => fallbackItemSize,
     // A newly observed element gets a real ResizeObserver box before paint. Reuse
@@ -402,10 +428,10 @@ export function createTimelineVirtualizer(input: Input) {
       return getItemKey()
     },
     get anchorTo() {
-      return input.follow.following() ? "end" : "start"
+      return follows() ? "end" : "start"
     },
     get followOnAppend() {
-      return input.follow.following()
+      return follows()
     },
     scrollEndThreshold: 80,
     get scrollMargin() {
@@ -648,6 +674,31 @@ export function createTimelineVirtualizer(input: Input) {
     virtualizer.options.scrollToFn(offset, {}, virtualizer)
   }
 
+  // A view that is built again has no offset of its own yet. It starts at the place kept from the view it replaces:
+  // the same row at the top, as far into it. The kept place is used once; from then on the virtualizer's offset is
+  // the place.
+  function restorePlace() {
+    const saved = cache.get(ownerSessionKey)
+    const kept = saved?.place
+
+    if (!saved || !kept) return
+    saved.place = undefined
+    const item = virtualizer.measurementsCache[rowKeys().indexOf(kept.key)]
+
+    if (!item || input.follow.following() || input.follow.anchor()) return
+    virtualizer.options.scrollToFn(Math.max(0, item.start + Math.min(kept.offset, item.size)), {}, virtualizer)
+  }
+
+  // Where a reader who has left the end is, for a view that is built again later.
+  function place() {
+    const offset = virtualizer.scrollOffset
+
+    if (untrack(follows) || offset === null) return undefined
+    const item = virtualizer.getVirtualItemForOffset(offset)
+
+    return item && { key: String(item.key), offset: offset - item.start }
+  }
+
   function flushTouchAdjustment() {
     touchAdjustment = 0
     const adjustment = rendering.scrollAdjustment
@@ -697,6 +748,7 @@ export function createTimelineVirtualizer(input: Input) {
       if (reveal) input.reveal?.consume(reveal.entryKey)
 
       if (!revealed && input.follow.following()) virtualizer.scrollToEnd()
+      restorePlace()
 
       reportOffset?.(root.scrollTop, false)
       dispatchCold(CHECK_REQUESTED)
@@ -1308,6 +1360,7 @@ export function createTimelineVirtualizer(input: Input) {
       toolOpen: { ...toolOpen },
       patchGroupKeys,
       presentationKey: input.presentationKey?.(),
+      place: place(),
     })
 
     while (cache.size > 16) cache.delete(cache.keys().next().value!)
